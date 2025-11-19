@@ -10,36 +10,34 @@ CORS(app)
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 
 # =========================
-# Predefined Tokens & Passwords
+# Predefined Tokens
 # =========================
 PREDEFINED_TOKENS = ["km8686", "kmk8686", "km5630"]
 token_passwords = {t: "12345678" for t in PREDEFINED_TOKENS}
-
-# Admin password
 ADMIN_PASSWORD = "12345678"
 
-# Mobile caps per token
+# Mobile caps
 token_mobile_caps = {t: None for t in PREDEFINED_TOKENS}
 token_processed_mobiles = {t: set() for t in PREDEFINED_TOKENS}
 
 # =========================
-# Final Storage (cleaned)
+# Storage
 # =========================
-mobile_groups = {t: {} for t in PREDEFINED_TOKENS}   # per-token per-mobile OTP lists
-vehicle_otps = {t: [] for t in PREDEFINED_TOKENS}    # vehicle OTPs
-otp_data = {t: [] for t in PREDEFINED_TOKENS}        # all historical OTPs
-client_sessions = {t: {} for t in PREDEFINED_TOKENS} # browser polling sessions
-login_sessions = {t: {} for t in PREDEFINED_TOKENS}
+mobile_groups = {t: {} for t in PREDEFINED_TOKENS}     # per-token mobile OTPs
+vehicle_otps = {t: [] for t in PREDEFINED_TOKENS}      # vehicle OTPs
+otp_data = {t: [] for t in PREDEFINED_TOKENS}          # retained history
+client_sessions = {t: {} for t in PREDEFINED_TOKENS}   # browser sessions
+login_sessions = {t: {} for t in PREDEFINED_TOKENS}    # login detect
 
 # =========================
-# Helpers
+# Helper
 # =========================
 def valid_token(token: str) -> bool:
     return token in PREDEFINED_TOKENS
 
 
 # =========================
-# API: Receive OTP
+# RECEIVE OTP
 # =========================
 @app.route('/api/receive-otp', methods=['POST'])
 def receive_otp():
@@ -57,7 +55,7 @@ def receive_otp():
 
         now_dt = datetime.now(IST)
 
-        # enforce mobile cap for non-vehicle
+        # Enforce cap for mobiles only
         if not vehicle:
             if sim_number not in token_processed_mobiles[token]:
                 cap = token_mobile_caps[token]
@@ -90,10 +88,8 @@ def receive_otp():
         sim_number = sim_number or "UNKNOWNSIM"
         entry["sim_number"] = sim_number
 
-        # store in history
         otp_data[token].append(entry.copy())
 
-        # store in mobile groups
         if sim_number not in mobile_groups[token]:
             mobile_groups[token][sim_number] = []
         mobile_groups[token][sim_number].append(entry.copy())
@@ -105,7 +101,7 @@ def receive_otp():
 
 
 # =========================
-# API: Get Latest OTP
+# GET LATEST OTP
 # =========================
 @app.route('/api/get-latest-otp', methods=['GET'])
 def get_latest_otp():
@@ -123,32 +119,36 @@ def get_latest_otp():
     now_ts = time.time()
     now_dt = datetime.now(IST)
 
-    # Create or update browser session
-    key = (identifier, browser_id)
-    if key not in client_sessions[token]:
-        client_sessions[token][key] = {
+    # Create/update session
+    sess_key = (identifier, browser_id)
+    if sess_key not in client_sessions[token]:
+        client_sessions[token][sess_key] = {
             "first_request_ts": now_ts,
             "first_request_dt": now_dt,
             "last_request_ts": now_ts
         }
     else:
-        client_sessions[token][key]["last_request_ts"] = now_ts
+        client_sessions[token][sess_key]["last_request_ts"] = now_ts
 
-    sess = client_sessions[token][key]
+    sess = client_sessions[token][sess_key]
     first_ts = sess["first_request_ts"]
 
-    # VEHICLE OTP polling
+    # VEHICLE OTP FLOW
     if vehicle:
         new_otps = [
             o for o in vehicle_otps[token]
             if o["vehicle"] == vehicle and o["timestamp"].timestamp() > first_ts
         ]
+
         if not new_otps:
             return jsonify({"status": "waiting"}), 200
 
         latest = new_otps[-1]
         latest["browser_id"] = browser_id
         otp_data[token].append(latest.copy())
+
+        # REMOVE BROWSER SESSION AFTER OTP DELIVERED
+        client_sessions[token].pop(sess_key, None)
 
         return jsonify({
             "status": "success",
@@ -158,12 +158,11 @@ def get_latest_otp():
             "timestamp": latest["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
         }), 200
 
-    # MOBILE OTP polling
+    # MOBILE OTP FLOW
     if sim_number not in mobile_groups[token]:
         return jsonify({"status": "waiting"}), 200
 
     all_otps = mobile_groups[token][sim_number]
-
     new_otps = [
         o for o in all_otps
         if o["timestamp"].timestamp() > first_ts
@@ -173,6 +172,9 @@ def get_latest_otp():
         return jsonify({"status": "waiting"}), 200
 
     latest = new_otps[-1]
+
+    # REMOVE BROWSER SESSION AFTER OTP DELIVERED
+    client_sessions[token].pop(sess_key, None)
 
     return jsonify({
         "status": "success",
@@ -184,7 +186,7 @@ def get_latest_otp():
 
 
 # =========================
-# LOGIN DETECTION APIs
+# LOGIN DETECT
 # =========================
 @app.route('/api/login-detect', methods=['POST'])
 def login_detect():
