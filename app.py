@@ -23,10 +23,10 @@ token_processed_mobiles = {t: set() for t in PREDEFINED_TOKENS}
 # =========================
 # Storage
 # =========================
-mobile_groups = {t: {} for t in PREDEFINED_TOKENS}     # per-token mobile OTPs
-vehicle_otps = {t: [] for t in PREDEFINED_TOKENS}      # vehicle OTPs
+mobile_groups = {t: {} for t in PREDEFINED_TOKENS}     # per-token mobile OTPs (sim_number -> list of entries)
+vehicle_otps = {t: [] for t in PREDEFINED_TOKENS}      # vehicle OTPs (list of entries)
 otp_data = {t: [] for t in PREDEFINED_TOKENS}          # retained history of deliveries
-client_sessions = {t: {} for t in PREDEFINED_TOKENS}   # browser sessions
+client_sessions = {t: {} for t in PREDEFINED_TOKENS}   # browser sessions keyed by (identifier, browser_id)
 login_sessions = {t: {} for t in PREDEFINED_TOKENS}    # login detect
 
 # =========================
@@ -84,7 +84,7 @@ def receive_otp():
             # store vehicle OTP
             vehicle_otps[token].append(entry.copy())
 
-            # history store
+            # history store (raw arrival)
             otp_data[token].append(entry.copy())
             return jsonify({"status": "success"}), 200
 
@@ -92,7 +92,7 @@ def receive_otp():
         sim_number = sim_number or "UNKNOWNSIM"
         entry["sim_number"] = sim_number
 
-        # store in history
+        # store in history (raw arrival)
         otp_data[token].append(entry.copy())
 
         # store in mobile group
@@ -132,36 +132,39 @@ def get_latest_otp():
         client_sessions[token][sess_key] = {
             "first_request_ts": now_ts,
             "first_request_dt": now_dt,
-            "last_request_ts": now_ts
+            "last_request_ts": now_ts,
+            "last_delivered_ts": 0   # timestamp of last OTP delivered to this browser-session
         }
     else:
         client_sessions[token][sess_key]["last_request_ts"] = now_ts
 
     sess = client_sessions[token][sess_key]
+    # first_ts kept for compatibility but not used for delivery gating anymore
     first_ts = sess["first_request_ts"]
 
     # ========================
     # VEHICLE OTP POLLING
     # ========================
     if vehicle:
+        # find OTPS for that vehicle that are newer than this session's last_delivered_ts
         new_otps = [
             o for o in vehicle_otps[token]
-            if o["vehicle"] == vehicle and o["timestamp"].timestamp() > first_ts
+            if o["vehicle"] == vehicle and o["timestamp"].timestamp() > sess.get("last_delivered_ts", 0)
         ]
 
         if not new_otps:
             return jsonify({"status": "waiting"}), 200
 
-        # newest OTP
+        # newest OTP for this session
         latest = new_otps[-1]
 
-        # store browser id in history
+        # store browser id in history — record per-browser delivery
         latest_with_browser = latest.copy()
         latest_with_browser["browser_id"] = browser_id
         otp_data[token].append(latest_with_browser)
 
-        # delete browser session after delivery
-        client_sessions[token].pop(sess_key, None)
+        # update this session's last_delivered_ts so same session won't get same OTP again
+        client_sessions[token][sess_key]["last_delivered_ts"] = latest["timestamp"].timestamp()
 
         return jsonify({
             "status": "success",
@@ -179,25 +182,25 @@ def get_latest_otp():
 
     all_otps = mobile_groups[token][sim_number]
 
-    # Only after first browser request timestamp
+    # Only deliver OTPs that are newer than this session's last_delivered_ts
     new_otps = [
         o for o in all_otps
-        if o["timestamp"].timestamp() > first_ts
+        if o["timestamp"].timestamp() > sess.get("last_delivered_ts", 0)
     ]
 
     if not new_otps:
         return jsonify({"status": "waiting"}), 200
 
-    # latest OTP
+    # latest OTP for this session
     latest = new_otps[-1]
 
-    # store browser id in otp_data history
+    # store browser id in otp_data history (per-browser)
     latest_with_browser = latest.copy()
     latest_with_browser["browser_id"] = browser_id
     otp_data[token].append(latest_with_browser)
 
-    # remove browser session after delivery
-    client_sessions[token].pop(sess_key, None)
+    # update this session's last_delivered_ts so same session won't get same OTP again
+    client_sessions[token][sess_key]["last_delivered_ts"] = latest["timestamp"].timestamp()
 
     return jsonify({
         "status": "success",
@@ -409,7 +412,7 @@ def admin_token_login_details(token):
         return partial
     return redirect(url_for("admin"))
 
-# Admin: master reset panel
+# Admin: master reset panel (OPTION 1 applied - removed undefined mobile_otps and browser_queues)
 @app.route('/admin/master-reset', methods=['GET', 'POST'])
 def admin_master_reset():
     if not session.get("is_admin"):
@@ -429,9 +432,8 @@ def admin_master_reset():
                 otp_data[token].clear()
                 login_sessions[token].clear()
                 token_processed_mobiles[token].clear()
-                mobile_otps[token].clear()
+                # mobile_otps and browser_queues removed (Option 1)
                 vehicle_otps[token].clear()
-                browser_queues[token].clear()
                 client_sessions[token].clear()
         else:
             for token in PREDEFINED_TOKENS:
@@ -442,12 +444,13 @@ def admin_master_reset():
                 if reset_processed_mobiles:
                     token_processed_mobiles[token].clear()
                 if reset_mobile_otps:
-                    mobile_otps[token].clear()
+                    # nothing named mobile_otps exists — skip (Option 1)
+                    pass
                 if reset_vehicle_otps:
                     vehicle_otps[token].clear()
                 if reset_browser_queues:
-                    browser_queues[token].clear()
-                    client_sessions[token].clear()  # Clear client_sessions if browser_queues is reset
+                    # browser_queues not defined — instead clear client_sessions as the closest equivalent
+                    client_sessions[token].clear()
         return redirect(url_for("admin"))
 
     if request.args.get("embed") == "1":
