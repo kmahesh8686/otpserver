@@ -262,11 +262,17 @@ def login_found():
     return jsonify({"status": "not_found", "mobile_number": mobile_number}), 200
     
 
-@app.route('/api/clear-login-detect', methods=['POST'])
+@app.route('/api/clear-login-detect', methods=['POST', 'GET'])
 def clear_login_detect():
     try:
-        data = request.get_json(force=True)
-        token = (data.get("token") or "").strip()
+        # ---- GET (bookmark / address bar) ----
+        if request.method == 'GET':
+            token = (request.args.get("token") or "").strip()
+
+        # ---- POST (API / script) ----
+        else:
+            data = request.get_json(force=True, silent=True) or {}
+            token = (data.get("token") or "").strip()
 
         if not token:
             return jsonify({
@@ -280,10 +286,15 @@ def clear_login_detect():
                 "message": "Invalid token"
             }), 403
 
+        # OPTIONAL: admin-only protection
+        # if not session.get("is_admin"):
+        #     return jsonify({"status": "error", "message": "unauthorized"}), 401
+
         login_sessions[token].clear()
 
         return jsonify({
             "status": "success",
+            "token": token,
             "message": f"Login detections cleared for token {token}"
         }), 200
 
@@ -292,6 +303,7 @@ def clear_login_detect():
             "status": "error",
             "message": str(e)
         }), 500
+
 
 
 @app.route('/api/check-login-status', methods=['GET'])
