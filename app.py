@@ -260,6 +260,38 @@ def login_found():
         }), 200
 
     return jsonify({"status": "not_found", "mobile_number": mobile_number}), 200
+    
+
+@app.route('/api/clear-login-detect', methods=['POST'])
+def clear_login_detect():
+    try:
+        data = request.get_json(force=True)
+        token = (data.get("token") or "").strip()
+
+        if not token:
+            return jsonify({
+                "status": "error",
+                "message": "token required"
+            }), 400
+
+        if not valid_token(token):
+            return jsonify({
+                "status": "error",
+                "message": "Invalid token"
+            }), 403
+
+        login_sessions[token].clear()
+
+        return jsonify({
+            "status": "success",
+            "message": f"Login detections cleared for token {token}"
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
 
 
 @app.route('/api/check-login-status', methods=['GET'])
