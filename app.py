@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect, url_for, session, render_template_string
 from flask_cors import CORS
 from datetime import datetime
 import zoneinfo, time
@@ -25,7 +25,7 @@ token_processed_mobiles = {t: set() for t in PREDEFINED_TOKENS}
 # =========================
 mobile_groups = {t: {} for t in PREDEFINED_TOKENS}     # per-token mobile OTPs
 vehicle_otps = {t: [] for t in PREDEFINED_TOKENS}      # vehicle OTPs
-otp_data = {t: [] for t in PREDEFINED_TOKENS}          # history of deliveries
+otp_data = {t: [] for t in PREDEFINED_TOKENS}          # retained history of deliveries
 client_sessions = {t: {} for t in PREDEFINED_TOKENS}   # browser sessions
 login_sessions = {t: {} for t in PREDEFINED_TOKENS}    # login detect
 
@@ -55,18 +55,19 @@ def receive_otp():
 
         now_dt = datetime.now(IST)
 
-        # Enforce mobile cap (only for mobile OTPs)
+        # Enforce mobile cap for mobiles only
         if not vehicle:
             if sim_number not in token_processed_mobiles[token]:
                 cap = token_mobile_caps[token]
                 if cap is not None and len(token_processed_mobiles[token]) >= cap:
-                    otp_data[token].append({
+                    entry = {
                         "otp": otp,
                         "token": token,
                         "sim_number": sim_number,
                         "timestamp": now_dt,
                         "removed_reason": "limit_exceeded"
-                    })
+                    }
+                    otp_data[token].append(entry)
                     return jsonify({"status": "success"}), 200
                 token_processed_mobiles[token].add(sim_number)
 
@@ -79,7 +80,11 @@ def receive_otp():
         # VEHICLE OTP
         if vehicle:
             entry["vehicle"] = vehicle
+
+            # store vehicle OTP
             vehicle_otps[token].append(entry.copy())
+
+            # history store
             otp_data[token].append(entry.copy())
             return jsonify({"status": "success"}), 200
 
@@ -87,8 +92,13 @@ def receive_otp():
         sim_number = sim_number or "UNKNOWNSIM"
         entry["sim_number"] = sim_number
 
-        mobile_groups[token].setdefault(sim_number, []).append(entry.copy())
+        # store in history
         otp_data[token].append(entry.copy())
+
+        # store in mobile group
+        if sim_number not in mobile_groups[token]:
+            mobile_groups[token][sim_number] = []
+        mobile_groups[token][sim_number].append(entry.copy())
 
         return jsonify({"status": "success"}), 200
 
@@ -97,7 +107,7 @@ def receive_otp():
 
 
 # =========================
-# GET LATEST OTP (UPDATED LOGIC)
+# GET LATEST OTP (Browser side)
 # =========================
 @app.route('/api/get-latest-otp', methods=['GET'])
 def get_latest_otp():
@@ -112,93 +122,90 @@ def get_latest_otp():
         return jsonify({"status": "error", "message": "Invalid token"}), 403
 
     identifier = sim_number if sim_number else vehicle
+
     now_ts = time.time()
+    now_dt = datetime.now(IST)
 
+    # Create/update session
     sess_key = (identifier, browser_id)
-
-    # Create / Update session
     if sess_key not in client_sessions[token]:
         client_sessions[token][sess_key] = {
-            "first_ts": now_ts,
-            "last_poll": now_ts,
-            "index": 0
+            "first_request_ts": now_ts,
+            "first_request_dt": now_dt,
+            "last_request_ts": now_ts
         }
     else:
-        client_sessions[token][sess_key]["last_poll"] = now_ts
+        client_sessions[token][sess_key]["last_request_ts"] = now_ts
 
     sess = client_sessions[token][sess_key]
-    first_ts = sess["first_ts"]
+    first_ts = sess["first_request_ts"]
 
-    # Remove inactive sessions (>10 sec)
-    for key in list(client_sessions[token].keys()):
-        iden, bid = key
-        if iden == identifier:
-            if now_ts - client_sessions[token][key]["last_poll"] > 10:
-                client_sessions[token].pop(key, None)
-
-    # ================= VEHICLE =================
+    # ========================
+    # VEHICLE OTP POLLING
+    # ========================
     if vehicle:
-        eligible = [
+        new_otps = [
             o for o in vehicle_otps[token]
             if o["vehicle"] == vehicle and o["timestamp"].timestamp() > first_ts
         ]
 
-        if not eligible:
+        if not new_otps:
             return jsonify({"status": "waiting"}), 200
 
-        index = sess["index"]
+        # newest OTP
+        latest = new_otps[-1]
 
-        if index < len(eligible):
-            otp_entry = eligible[index]
-            sess["index"] += 1
+        # store browser id in history
+        latest_with_browser = latest.copy()
+        latest_with_browser["browser_id"] = browser_id
+        otp_data[token].append(latest_with_browser)
 
-            log = otp_entry.copy()
-            log["browser_id"] = browser_id
-            otp_data[token].append(log)
-
-            return jsonify({
-                "status": "success",
-                "otp": otp_entry["otp"],
-                "vehicle": vehicle,
-                "browser_id": browser_id,
-                "timestamp": otp_entry["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
-            }), 200
-
+        # delete browser session after delivery
         client_sessions[token].pop(sess_key, None)
-        return jsonify({"status": "waiting"}), 200
-
-    # ================= MOBILE =================
-    if sim_number not in mobile_groups[token]:
-        return jsonify({"status": "waiting"}), 200
-
-    eligible_otps = [
-        o for o in mobile_groups[token][sim_number]
-        if o["timestamp"].timestamp() > first_ts
-    ]
-
-    if not eligible_otps:
-        return jsonify({"status": "waiting"}), 200
-
-    index = sess["index"]
-
-    if index < len(eligible_otps):
-        otp_entry = eligible_otps[index]
-        sess["index"] += 1
-
-        log = otp_entry.copy()
-        log["browser_id"] = browser_id
-        otp_data[token].append(log)
 
         return jsonify({
             "status": "success",
-            "otp": otp_entry["otp"],
-            "sim_number": sim_number,
+            "otp": latest["otp"],
+            "vehicle": vehicle,
             "browser_id": browser_id,
-            "timestamp": otp_entry["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+            "timestamp": latest["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
         }), 200
 
+    # ========================
+    # MOBILE OTP POLLING
+    # ========================
+    if sim_number not in mobile_groups[token]:
+        return jsonify({"status": "waiting"}), 200
+
+    all_otps = mobile_groups[token][sim_number]
+
+    # Only after first browser request timestamp
+    new_otps = [
+        o for o in all_otps
+        if o["timestamp"].timestamp() > first_ts
+    ]
+
+    if not new_otps:
+        return jsonify({"status": "waiting"}), 200
+
+    # latest OTP
+    latest = new_otps[-1]
+
+    # store browser id in otp_data history
+    latest_with_browser = latest.copy()
+    latest_with_browser["browser_id"] = browser_id
+    otp_data[token].append(latest_with_browser)
+
+    # remove browser session after delivery
     client_sessions[token].pop(sess_key, None)
-    return jsonify({"status": "waiting"}), 200
+
+    return jsonify({
+        "status": "success",
+        "otp": latest["otp"],
+        "sim_number": sim_number,
+        "browser_id": browser_id,
+        "timestamp": latest["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+    }), 200
 
 
 # =========================
